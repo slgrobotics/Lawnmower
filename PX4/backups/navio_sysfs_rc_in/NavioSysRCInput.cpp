@@ -40,13 +40,26 @@
 
 using namespace time_literals;
 
+#define DRV_RC_DEVTYPE_RCNAVIO2	0x8a
+
+#define TEENSY_BUS				1       // 0 = /dev/i2c-0 (port I2C0), 1 = /dev/i2c-1 (port I2C1)
+#define TEENSY_ADDR				0x48	// I2C adress
+#define TEENSY_REG				0x00
+#define I2C_BUS_FREQUENCY		400000
+
 namespace navio_sysfs_rc_in
 {
 
 NavioSysRCInput::NavioSysRCInput() :
-	ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::hp_default)
+	I2C(DRV_RC_DEVTYPE_RCNAVIO2, MODULE_NAME, TEENSY_BUS, TEENSY_ADDR, I2C_BUS_FREQUENCY),
+	ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::hp_default),
+	_comms_errors(perf_alloc(PC_COUNT, MODULE_NAME": com_err"))
+
 {
+	PX4_INFO("NavioSysRCInput::NavioSysRCInput()");
 	_isRunning = true;
+	//memset(data, 0, sizeof(data));
+
 };
 
 NavioSysRCInput::~NavioSysRCInput()
@@ -55,37 +68,31 @@ NavioSysRCInput::~NavioSysRCInput()
 
 	_isRunning = false;
 
-	for (int i = 0; i < CHANNELS; ++i) {
-		::close(_channel_fd[i]);
-	}
-
-	::close(_connected_fd);
+	PX4_INFO("NavioSysRCInput::~NavioSysRCInput()");
 
 	perf_free(_publish_interval_perf);
 }
 
 int NavioSysRCInput::navio_rc_init()
 {
-	_connected_fd = ::open("/sys/kernel/rcio/rcin/connected", O_RDONLY);
+	PX4_INFO("NavioSysRCInput::navio_rc_init()");
 
-	for (int i = 0; i < CHANNELS; ++i) {
-		char buf[80] {};
-		::snprintf(buf, sizeof(buf), "%s/ch%d", "/sys/kernel/rcio/rcin", i);
-		int fd = ::open(buf, O_RDONLY);
+	int ret;
+	ret = I2C::init();
 
-		if (fd < 0) {
-			PX4_ERR("open %s (%d) failed", buf, i);
-			break;
-		}
-
-		_channel_fd[i] = fd;
+	if (ret != OK) {
+		return ret;
 	}
 
-	return PX4_OK;
+	ScheduleNow();
+
+	return ret;
 }
 
 int NavioSysRCInput::start()
 {
+	PX4_INFO("NavioSysRCInput::start()");
+
 	navio_rc_init();
 
 	_should_exit.store(false);
@@ -97,6 +104,8 @@ int NavioSysRCInput::start()
 
 void NavioSysRCInput::stop()
 {
+	PX4_INFO("NavioSysRCInput::stop()");
+
 	_should_exit.store(true);
 }
 
@@ -107,47 +116,58 @@ void NavioSysRCInput::Run()
 		return;
 	}
 
+	/*
 	char connected_buf[12] {};
 	int ret_connected = ::pread(_connected_fd, connected_buf, sizeof(connected_buf) - 1, 0);
 
 	if (ret_connected < 0) {
 		return;
 	}
-
-	input_rc_s data{};
-
-	connected_buf[sizeof(connected_buf) - 1] = '\0';
-	_connected = (atoi(connected_buf) == 1);
-
-	data.rc_lost = !_connected;
+	*/
 
 	uint64_t timestamp_sample = hrt_absolute_time();
+	input_rc_s data{};
+	data.rc_lost = 0;
 
-	for (int i = 0; i < CHANNELS; ++i) {
-		char buf[12] {};
-		int res = ::pread(_channel_fd[i], buf, sizeof(buf) - 1, 0);
+	data.values[0] = 1230;
+	data.values[1] = 1502;
+	data.values[2] = 1503;
 
-		if (res < 0) {
-			continue;
-		}
+	uint8_t _block[18];
 
-		buf[sizeof(buf) - 1] = '\0';
+	int ret = transfer(nullptr, 0, _block, 18);
 
-		data.values[i] = atoi(buf);
-	}
-
-	// check if all channels are 0
-	bool all_zero = true;
-
-	for (int i = 0; i < CHANNELS; ++i) {
-		if (data.values[i] != 0) {
-			all_zero = false;
-		}
-	}
-
-	if (all_zero) {
+	if (OK != ret) {
+		perf_count(_comms_errors);
+		PX4_ERR("NavioSysRCInput::Run() - I2C transfer() returned %d", ret);
+		DEVICE_LOG("i2c::transfer returned %d", ret);
 		return;
 	}
+
+	for(int i=0; i < 9; ++i) {
+		int j = i << 1;
+		data.values[i] = ((uint16_t)_block[j]) + (((uint16_t)_block[j+1]) << 8);
+	}
+
+	// data.values[0-6] - channel 1..7 values, must be within 800..2200 range
+	// data.values[7] - channel 8 value, programmed on the receiver to be 1999 on fail (also 1999 when second left switch down)
+	// data.values[8] - milliseconds since Teensy last received valid PPM signal from the receiver
+
+	// check if all channels are within the 800..2200 range:
+	for (int i = 0; i < 8; ++i) {
+		if (data.values[i] < 800 || data.values[i] > 2200) {
+			perf_count(_comms_errors);
+			return; // skip this cycle
+		}
+	}
+
+	// R/C channel 8 is also failsafe indicator, as programmed in the receiver.
+	// The second left switch still works, emulating failsafe in down position.
+	// values for switch up: 999 down: 1999
+	// the "ch9" value is milliseconds since Teensy last received valid PPM signal from the receiver, normally 1..20
+
+	data.rc_lost = (data.values[7] > 1700 && data.values[7] <= 2200) || (data.values[8] > 100);
+	_lastRcLost = data.rc_lost;
 
 	data.timestamp_last_signal = timestamp_sample;
 	data.channel_count = CHANNELS;
@@ -161,9 +181,10 @@ void NavioSysRCInput::Run()
 int NavioSysRCInput::print_status()
 {
 	PX4_INFO("Running");
-	PX4_INFO("connected: %d", _connected);
+	PX4_INFO("Teensy on I2C bus: %d addr: 0x%x  R/C Lost: %s", TEENSY_BUS, TEENSY_ADDR, _lastRcLost ? "true" : "false");
 
 	perf_print_counter(_publish_interval_perf);
+	perf_print_counter(_comms_errors);
 
 	return 0;
 }

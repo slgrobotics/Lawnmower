@@ -34,6 +34,8 @@
 
 #pragma once
 
+#include <drivers/device/i2c.h>
+#include <px4_platform_common/i2c_spi_buses.h>
 #include <px4_platform_common/px4_config.h>
 #include <px4_platform_common/atomic.h>
 #include <px4_platform_common/defines.h>
@@ -46,7 +48,7 @@
 namespace navio_sysfs_rc_in
 {
 
-class NavioSysRCInput : public px4::ScheduledWorkItem
+class NavioSysRCInput : public device::I2C, public px4::ScheduledWorkItem
 {
 public:
 	NavioSysRCInput();
@@ -73,13 +75,16 @@ private:
 
 	uORB::PublicationMulti<input_rc_s> _input_rc_pub{ORB_ID(input_rc)};
 
-	static constexpr int CHANNELS{14};
-	int _channel_fd[CHANNELS] {};
-	int _connected_fd{-1};
+    static constexpr int CHANNELS{8};
 
 	bool _connected{false};
 
+    bool _lastRcLost{true};
+
 	perf_counter_t _publish_interval_perf{perf_alloc(PC_INTERVAL, MODULE_NAME": publish interval")};
+
+    perf_counter_t		_comms_errors;
+
 };
 
 }; // namespace navio_sysfs_rc_in
